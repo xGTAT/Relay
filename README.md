@@ -19,6 +19,7 @@ Status: early prototype. The list below separates what runs today from what is p
 - Model router: Qwen via OpenRouter first, automatic Groq fallback
 - Memory: last 20 messages per user, stored in SQLite (`relay.db`) so it survives restarts
 - Reminders: "remind me in 2 hours to submit the lab report" pings you in Slack at that time (up to 7 days). Pending reminders are stored in SQLite and re-armed on restart; ones that came due while offline fire on boot
+- Course PDFs: upload a PDF in Slack and Relay indexes it per user (SQLite full-text search). Ask questions about it and get answers with document and page references, or ask for a quiz with an answer key. Text PDFs only, no OCR for scans
 - Channel allowlist and optional mention-required mode
 
 ## Planned
@@ -26,8 +27,8 @@ Status: early prototype. The list below separates what runs today from what is p
 | Feature | What it will do |
 |---|---|
 | Smart reminders, automatic | Pick up assignment, exam and competition dates from your LMS and inbox and set reminders for you |
-| Course-aware research | Answer questions from the PDFs your professors share, not the generic web |
-| Study packs and quizzes | Turn course PDFs into summaries and practice questions |
+| Course-aware research, deeper | Pull course material automatically from the LMS and handle scanned PDFs (today you upload text PDFs by hand) |
+| Study packs | Summaries and revision plans from course PDFs (quizzes already work) |
 | Announcement digest | One daily Slack message that summarizes college emails and notices |
 | Deadline triage | A ranked "do this first" list when several submissions land in the same week |
 | Connectors | GitHub and Google (Docs, Slides, Calendar) status and actions in chat |
@@ -43,8 +44,9 @@ Group project coordination is the long-term differentiator: separately owned ins
 1. Create the Slack app: at https://api.slack.com/apps choose **Create New App > From a manifest** and paste `slack-app-manifest.yml`. Install it to your workspace.
 2. Copy the **Bot User OAuth Token** (`xoxb-...`, OAuth & Permissions) into `SLACK_BOT_TOKEN`.
 3. Under **Basic Information > App-Level Tokens**, create a token with the `connections:write` scope and copy it (`xapp-...`) into `SLACK_APP_TOKEN`.
-4. Create an OpenRouter key at https://openrouter.ai/keys. Copy `.env.example` to `.env` and fill in `OPENROUTER_API_KEY`. Optionally add `GROQ_API_KEY` and `GROQ_MODEL` for the fallback.
-5. Run:
+4. PDF reading needs the `files:read` scope, which is in the manifest. If the app was installed before, reinstall it to the workspace so Slack grants it.
+5. Create an OpenRouter key at https://openrouter.ai/keys. Copy `.env.example` to `.env` and fill in `OPENROUTER_API_KEY`. Optionally add `GROQ_API_KEY` and `GROQ_MODEL` for the fallback.
+6. Run:
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -69,6 +71,7 @@ Invite the bot to a channel (`/invite @Relay`) or DM it from the Apps section.
 ## Tests
 
 ```bash
+pip install reportlab  # used to generate test PDFs
 python test_history.py
 ```
 
