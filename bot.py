@@ -6,7 +6,7 @@ Pure Python, Slack Bolt in Socket Mode (no public endpoint needed).
 
 Features:
   - Qwen via OpenRouter as the primary model, Groq as automatic fallback (both configured by env)
-  - Sliding window conversation memory per user (20 messages, in-process)
+  - Conversation memory per user (last 20 messages replayed), stored in SQLite
   - Background reminders that @-mention the user in Slack, via asyncio
   - Natural, adaptive tone: casual for chat, structured for work
   - Hourglass reaction while processing, removed after the reply
@@ -15,8 +15,7 @@ Features:
 Usage:
     python bot.py
 
-Ported from an earlier Discord bot. Prototype: memory and reminders are
-in-process and are lost on restart.
+Ported from an earlier Discord bot. Memory and reminders are stored in SQLite (relay.db).
 """
 
 import os
@@ -24,8 +23,7 @@ import re
 import json
 import asyncio
 import logging
-from collections import defaultdict, deque
-from dataclasses import dataclass, field
+import time
 from datetime import datetime
 from typing import Optional
 
@@ -34,6 +32,8 @@ from groq import AsyncGroq
 from openai import AsyncOpenAI
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
+
+from store import Store
 
 load_dotenv()
 
@@ -58,6 +58,7 @@ OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
 OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3.8-27b:free")
 # Groq has no default: set GROQ_MODEL in .env (see .env.example).
 GROQ_MODEL = os.getenv("GROQ_MODEL", "")
+DB_PATH = os.getenv("RELAY_DB_PATH", "relay.db")
 MAX_MEMORY = 20
 MAX_MESSAGE_LENGTH = 3000  # well under Slack's limit, keeps replies readable
 
@@ -100,22 +101,24 @@ def build_system_prompt() -> str:
 # Memory
 # ---------------------------------------------------------------------------
 
-@dataclass
 class SessionMemory:
-    """Sliding window of conversation history per user."""
-    _store: dict = field(default_factory=lambda: defaultdict(lambda: deque(maxlen=MAX_MEMORY)))
+    """Conversation history per user, persisted in SQLite (last MAX_MEMORY messages are replayed)."""
+
+    def __init__(self, store: Store):
+        self.store = store
 
     def add(self, user_id: str, role: str, content: str) -> None:
-        self._store[user_id].append({"role": role, "content": content})
+        self.store.add_message(user_id, role, content)
 
     def get_history(self, user_id: str) -> list[dict]:
-        return list(self._store[user_id])
+        return self.store.get_messages(user_id, MAX_MEMORY)
 
     def clear(self, user_id: str) -> None:
-        self._store[user_id].clear()
+        self.store.clear_messages(user_id)
 
 
-memory = SessionMemory()
+store = Store(DB_PATH)
+memory = SessionMemory(store)
 
 
 def groq_text_messages(messages: list[dict]) -> list[dict]:
@@ -148,8 +151,11 @@ def groq_text_messages(messages: list[dict]) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 class ReminderManager:
-    def __init__(self, slack_client):
+    """Schedules reminders. Every reminder is stored in SQLite first, so pending ones survive restarts."""
+
+    def __init__(self, slack_client, store: Store):
         self.client = slack_client
+        self.store = store
         self._tasks: list = []
         self.loop = None
 
@@ -158,24 +164,10 @@ class ReminderManager:
             self.loop = asyncio.get_running_loop()
         return self.loop
 
-    def schedule(
-        self,
-        channel_id: str,
-        user_id: str,
-        delay_seconds: int,
-        reminder_text: str,
-    ) -> str:
-        """Schedule a background reminder. Returns an immediate confirmation string.
-
-        Safe to call from any thread (tool execution may run off-loop);
-        the fire coroutine is submitted to the captured event loop.
-        """
-        delay_seconds = max(1, int(delay_seconds))
-        if delay_seconds > 7 * 24 * 3600:
-            log.warning(f"Reminder delay {delay_seconds}s exceeds 7 days, clamping to 7 days")
-            delay_seconds = 7 * 24 * 3600
+    def _spawn(self, reminder_id: int, channel_id: str, user_id: str, delay_seconds: float, text: str) -> None:
+        # Safe from any thread: the fire coroutine is submitted to the captured event loop.
         future = asyncio.run_coroutine_threadsafe(
-            self._fire(channel_id, user_id, delay_seconds, reminder_text),
+            self._fire(reminder_id, channel_id, user_id, delay_seconds, text),
             self._loop(),
         )
         self._tasks.append(future)
@@ -187,22 +179,50 @@ class ReminderManager:
                 pass
 
         future.add_done_callback(_cleanup)
+
+    def schedule(
+        self,
+        channel_id: str,
+        user_id: str,
+        delay_seconds: int,
+        reminder_text: str,
+    ) -> str:
+        """Store and schedule a reminder. Returns an immediate confirmation string."""
+        delay_seconds = max(1, int(delay_seconds))
+        if delay_seconds > 7 * 24 * 3600:
+            log.warning(f"Reminder delay {delay_seconds}s exceeds 7 days, clamping to 7 days")
+            delay_seconds = 7 * 24 * 3600
+        fire_at = time.time() + delay_seconds
+        reminder_id = self.store.add_reminder(user_id, channel_id, fire_at, reminder_text)
+        self._spawn(reminder_id, channel_id, user_id, delay_seconds, reminder_text)
         log.info(
-            f"Reminder scheduled: user={user_id} channel={channel_id} "
+            f"Reminder #{reminder_id} scheduled: user={user_id} channel={channel_id} "
             f"in {delay_seconds}s text={reminder_text!r}"
         )
         return f"Reminder set! I'll ping you in {_format_delay(delay_seconds)} to: {reminder_text}"
 
-    async def _fire(self, channel_id: str, user_id: str, delay_seconds: int, reminder_text: str) -> None:
+    def restore(self) -> int:
+        """Re-arm pending reminders after a restart. Overdue ones fire right away."""
+        rows = self.store.pending_reminders()
+        now = time.time()
+        for r in rows:
+            late = r["fire_at"] < now
+            text = r["text"] + (" (sent late, I was offline)" if late else "")
+            self._spawn(r["id"], r["channel_id"], r["user_id"], max(1, r["fire_at"] - now), text)
+        log.info(f"Restored {len(rows)} pending reminder(s)")
+        return len(rows)
+
+    async def _fire(self, reminder_id: int, channel_id: str, user_id: str, delay_seconds: float, reminder_text: str) -> None:
         await asyncio.sleep(delay_seconds)
         try:
             await self.client.chat_postMessage(
                 channel=channel_id,
                 text=f"<@{user_id}> :alarm_clock: *Reminder:* {reminder_text}",
             )
-            log.info(f"Reminder fired for user {user_id} in channel {channel_id}")
+            self.store.mark_reminder(reminder_id, "done")
+            log.info(f"Reminder #{reminder_id} fired for user {user_id} in channel {channel_id}")
         except Exception as e:
-            log.error(f"Failed to send reminder: {e}", exc_info=True)
+            log.error(f"Failed to send reminder #{reminder_id}: {e}", exc_info=True)
 
 
 def _format_delay(seconds: int) -> str:
@@ -474,7 +494,8 @@ async def main() -> None:
     auth = await app.client.auth_test()
     BOT_USER_ID = auth["user_id"]
     llm = LLMManager()
-    reminders = ReminderManager(app.client)
+    reminders = ReminderManager(app.client, store)
+    reminders.restore()
     log.info(f"Relay is online as {auth['user']} ({BOT_USER_ID}) in workspace {auth['team']}")
     log.info(f"Primary LLM: {OPENROUTER_MODEL} | Fallback: {GROQ_MODEL or 'none'}")
     log.info(f"Restricted to channels: {ALLOWED_CHANNEL_IDS or 'all the bot is in'}")
