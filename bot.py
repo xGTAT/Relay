@@ -205,6 +205,12 @@ class ReminderManager:
         )
         return f"Reminder set! I'll ping you in {_format_delay(delay_seconds)} to: {reminder_text}"
 
+    def schedule_at(self, channel_id: str, user_id: str, fire_at: float, reminder_text: str) -> int:
+        """Store and arm a reminder for an absolute time (used by deadlines, no 7 day clamp)."""
+        reminder_id = self.store.add_reminder(user_id, channel_id, fire_at, reminder_text)
+        self._spawn(reminder_id, channel_id, user_id, max(1, fire_at - time.time()), reminder_text)
+        return reminder_id
+
     def restore(self) -> int:
         """Re-arm pending reminders after a restart. Overdue ones fire right away."""
         rows = self.store.pending_reminders()
@@ -218,6 +224,8 @@ class ReminderManager:
 
     async def _fire(self, reminder_id: int, channel_id: str, user_id: str, delay_seconds: float, reminder_text: str) -> None:
         await asyncio.sleep(delay_seconds)
+        if self.store.reminder_status(reminder_id) != "pending":
+            return  # cancelled or already handled
         try:
             await self.client.chat_postMessage(
                 channel=channel_id,
@@ -306,7 +314,92 @@ QUIZ_TOOL = {
     },
 }
 
-TOOLS = [REMINDER_TOOL, ASK_PDF_TOOL, QUIZ_TOOL]
+ADD_DEADLINE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "add_deadline",
+        "description": (
+            "Save an assignment, exam, submission or event deadline for the user, with an automatic "
+            "Slack reminder shortly before it is due. Use this (not schedule_reminder) when the user "
+            "mentions something that is due or happens at a date."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "What is due, e.g. 'DBMS assignment 3'."},
+                "due_in_seconds": {"type": "integer", "description": "Seconds from now until it is due. Compute it from the current date and time."},
+                "remind_before_seconds": {"type": "integer", "description": "How long before the due time to ping the user. Default 86400 (one day)."},
+            },
+            "required": ["title", "due_in_seconds"],
+        },
+    },
+}
+
+LIST_DEADLINES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "list_deadlines",
+        "description": "List the user's open deadlines and pending reminders, soonest first. Use for 'what's due this week', 'what do I have coming up', and similar.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "days_ahead": {"type": "integer", "description": "Only include items due within this many days. Default 14. Overdue items are always included."},
+            },
+            "required": [],
+        },
+    },
+}
+
+TRIAGE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "triage_deadlines",
+        "description": "Get the user's open deadlines with time left and clustering, so you can rank what to do first. Use when they ask what to prioritise, or when several things are due close together.",
+        "parameters": {"type": "object", "properties": {}, "required": []},
+    },
+}
+
+COMPLETE_DEADLINE_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "complete_deadline",
+        "description": "Mark a deadline as done (and cancel its reminder). Use the number shown as #id in list_deadlines.",
+        "parameters": {
+            "type": "object",
+            "properties": {"deadline_id": {"type": "integer", "description": "The deadline number."}},
+            "required": ["deadline_id"],
+        },
+    },
+}
+
+TOOLS = [
+    REMINDER_TOOL, ASK_PDF_TOOL, QUIZ_TOOL,
+    ADD_DEADLINE_TOOL, LIST_DEADLINES_TOOL, TRIAGE_TOOL, COMPLETE_DEADLINE_TOOL,
+]
+
+
+def _human_delta(seconds: float) -> str:
+    """'in 3d 4h', '5h 10m' or 'overdue by 2h' for a signed number of seconds."""
+    overdue = seconds < 0
+    seconds = abs(int(seconds))
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes = rem // 60
+    if days:
+        text = f"{days}d {hours}h"
+    elif hours:
+        text = f"{hours}h {minutes}m"
+    else:
+        text = f"{max(minutes, 1)}m"
+    return f"overdue by {text}" if overdue else f"in {text}"
+
+
+def _fmt_when(ts: float) -> str:
+    return datetime.fromtimestamp(ts).astimezone().strftime("%a %d %b, %I:%M %p")
+
+
+def deadline_lines(rows: list[dict], now: float) -> list[str]:
+    return [f"#{r['id']} {r['title']} - due {_fmt_when(r['due_at'])} ({_human_delta(r['due_at'] - now)})" for r in rows]
 
 
 def format_passages(rows: list[dict]) -> str:
@@ -345,6 +438,54 @@ def run_tool(name: str, args: dict, reminder_manager, store, channel_id: str, us
         if not rows:
             rows = store.sample_chunks(user_id, 6, args.get("document_name"))
         return f"Write {n} questions with an answer key from these passages:\n\n" + format_passages(rows)
+    if name == "add_deadline":
+        now = time.time()
+        due_in = int(args["due_in_seconds"])
+        if due_in < 60 or due_in > 400 * 86400:
+            return "That due time looks wrong (past, or over a year away). Ask the user for the exact date and time."
+        before = max(0, int(args.get("remind_before_seconds") or 86400))
+        title = str(args["title"])
+        due_at = now + due_in
+        reminder_id = None
+        remind_note = "No reminder set because the due time is too close."
+        remind_at = due_at - before
+        if remind_at > now + 30:
+            reminder_id = reminder_manager.schedule_at(
+                channel_id, user_id, remind_at, f"{title} is due {_fmt_when(due_at)}"
+            )
+            remind_note = f"Reminder set for {_fmt_when(remind_at)}."
+        did = store.add_deadline(user_id, channel_id, title, due_at, reminder_id)
+        return f"Saved deadline #{did}: {title}, due {_fmt_when(due_at)}. {remind_note}"
+    if name == "list_deadlines":
+        now = time.time()
+        days = max(1, min(int(args.get("days_ahead") or 14), 365))
+        until = now + days * 86400
+        deadlines = store.list_deadlines(user_id, until)
+        reminders_ = store.list_reminders(user_id, until)
+        linked = {d["reminder_id"] for d in store.list_deadlines(user_id) if d["reminder_id"]}
+        lines = ["Deadlines:"] + (deadline_lines(deadlines, now) or ["(none)"])
+        extra = [
+            f"{r['text']} - pings {_fmt_when(r['fire_at'])} ({_human_delta(r['fire_at'] - now)})"
+            for r in reminders_ if r["id"] not in linked
+        ]
+        lines += ["Other reminders:"] + (extra or ["(none)"])
+        return "\n".join(lines)
+    if name == "triage_deadlines":
+        now = time.time()
+        rows = store.list_deadlines(user_id)
+        if not rows:
+            return "No open deadlines. Tell the user nothing is saved yet and offer to add some."
+        lines = deadline_lines(rows, now)
+        crowded = sum(1 for r in rows if r["due_at"] - rows[0]["due_at"] <= 48 * 3600)
+        note = f"{crowded} deadline(s) fall within 48 hours of the first one." if crowded > 1 else "No deadlines are clustered."
+        return (
+            "Open deadlines, soonest first:\n" + "\n".join(lines) + f"\n\n{note}\n"
+            "Rank these as a short 'do this first' list. Weigh time left and clustering, say why in a few words each, "
+            "and do not invent effort estimates the user has not given."
+        )
+    if name == "complete_deadline":
+        row = store.complete_deadline(user_id, int(args["deadline_id"]))
+        return f"Marked done: {row['title']}." if row else "No open deadline with that number."
     return f"Unknown tool: {name}"
 
 
