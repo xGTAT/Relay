@@ -14,10 +14,10 @@ from store import Store
 from pdfindex import chunk_pages, extract_pages
 
 source = ast.parse(Path(__file__).with_name('bot.py').read_text())
-keep = {'SessionMemory', 'groq_text_messages', 'LLMManager', 'ReminderManager', '_format_delay', 'format_passages', 'run_tool', 'ingest_pdfs', 'download_slack_file'}
-assigns = [n for n in source.body if isinstance(n, ast.Assign) and any(getattr(x, 'id', '') in {'REMINDER_TOOL', 'ASK_PDF_TOOL', 'QUIZ_TOOL', 'TOOLS'} for x in n.targets)]
+keep = {'SessionMemory', 'groq_text_messages', 'LLMManager', 'ReminderManager', '_format_delay', 'format_passages', 'run_tool', '_human_delta', '_fmt_when', 'deadline_lines', 'ingest_pdfs', 'download_slack_file'}
+assigns = [n for n in source.body if isinstance(n, ast.Assign) and any(getattr(x, 'id', '') in {'REMINDER_TOOL', 'ASK_PDF_TOOL', 'QUIZ_TOOL', 'ADD_DEADLINE_TOOL', 'LIST_DEADLINES_TOOL', 'TRIAGE_TOOL', 'COMPLETE_DEADLINE_TOOL', 'TOOLS'} for x in n.targets)]
 module = ast.Module(body=assigns + [n for n in source.body if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in keep], type_ignores=[])
-ns = dict(defaultdict=defaultdict, deque=deque, dataclass=dataclass, field=field, MAX_MEMORY=20, MAX_MESSAGE_LENGTH=3000, json=json, asyncio=asyncio, time=time, MAX_TOOL_CHARS=6000, MAX_PDF_BYTES=25*1024*1024, extract_pages=extract_pages, chunk_pages=chunk_pages, store=Store(':memory:'), SLACK_BOT_TOKEN='x', aiohttp=Mock(), Optional=object, Store=Store, GROQ_MODEL='mock', OPENROUTER_MODEL='mock-or', build_system_prompt=lambda: 'system', log=Mock())
+ns = dict(defaultdict=defaultdict, deque=deque, dataclass=dataclass, field=field, MAX_MEMORY=20, MAX_MESSAGE_LENGTH=3000, json=json, asyncio=asyncio, time=time, datetime=__import__('datetime').datetime, MAX_TOOL_CHARS=6000, MAX_PDF_BYTES=25*1024*1024, extract_pages=extract_pages, chunk_pages=chunk_pages, store=Store(':memory:'), SLACK_BOT_TOKEN='x', aiohttp=Mock(), Optional=object, Store=Store, GROQ_MODEL='mock', OPENROUTER_MODEL='mock-or', build_system_prompt=lambda: 'system', log=Mock())
 exec(compile(module, 'bot.py', 'exec'), ns)
 
 class HistoryTests(unittest.IsolatedAsyncioTestCase):
@@ -230,6 +230,73 @@ class PdfTests(unittest.IsolatedAsyncioTestCase):
         tool_msg = create.call_args_list[1].kwargs['messages'][-1]
         self.assertEqual(tool_msg['role'], 'tool')
         self.assertIn('notes.pdf, p.1', tool_msg['content'])
+
+class DeadlineTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        self.st = Store(':memory:')
+        self.rm = Mock()
+        self.rm.schedule_at.return_value = 7
+
+    def call(self, name, args, user='u'):
+        return ns['run_tool'](name, args, self.rm, self.st, 'c', user)
+
+    def test_human_delta(self):
+        self.assertEqual(ns['_human_delta'](3 * 86400 + 4 * 3600), 'in 3d 4h')
+        self.assertEqual(ns['_human_delta'](5400), 'in 1h 30m')
+        self.assertEqual(ns['_human_delta'](-7300), 'overdue by 2h 1m')
+
+    def test_add_list_triage_complete(self):
+        out = self.call('add_deadline', {'title': 'DBMS assignment', 'due_in_seconds': 2 * 86400})
+        self.assertIn('Saved deadline #1', out)
+        self.assertIn('Reminder set', out)
+        args = self.rm.schedule_at.call_args.args
+        self.assertEqual(args[0:2], ('c', 'u'))
+        self.assertAlmostEqual(args[2] - time.time(), 86400, delta=5)
+        self.call('add_deadline', {'title': 'OS quiz', 'due_in_seconds': 2 * 86400 + 3600, 'remind_before_seconds': 3600})
+        self.call('add_deadline', {'title': 'Hackathon form', 'due_in_seconds': 10 * 86400})
+        listing = self.call('list_deadlines', {'days_ahead': 7})
+        self.assertIn('DBMS assignment', listing)
+        self.assertIn('OS quiz', listing)
+        self.assertNotIn('Hackathon form', listing)
+        self.assertLess(listing.index('DBMS'), listing.index('OS quiz'))
+        triage = self.call('triage_deadlines', {})
+        self.assertIn('2 deadline(s) fall within 48 hours', triage)
+        self.assertIn('Hackathon form', triage)
+        self.assertIn('Marked done: DBMS assignment', self.call('complete_deadline', {'deadline_id': 1}))
+        self.assertNotIn('DBMS', self.call('list_deadlines', {}))
+        self.assertIn('No open deadline', self.call('complete_deadline', {'deadline_id': 1}))
+        self.assertIn('No open deadline', self.call('complete_deadline', {'deadline_id': 2}, user='other'))
+
+    def test_close_or_bad_due_times(self):
+        out = self.call('add_deadline', {'title': 'soon', 'due_in_seconds': 3600})
+        self.assertIn('No reminder set', out)
+        self.rm.schedule_at.assert_not_called()
+        self.assertIn('looks wrong', self.call('add_deadline', {'title': 'x', 'due_in_seconds': -5}))
+        self.assertIn('No open deadlines', self.call('triage_deadlines', {}, user='nobody'))
+
+    def test_completing_deadline_cancels_its_reminder(self):
+        rid = self.st.add_reminder('u', 'c', time.time() + 500, 'x')
+        did = self.st.add_deadline('u', 'c', 'Lab', time.time() + 900, rid)
+        self.st.complete_deadline('u', did)
+        self.assertEqual(self.st.reminder_status(rid), 'cancelled')
+
+    async def test_cancelled_reminder_does_not_fire(self):
+        st = Store(':memory:')
+        rid = st.add_reminder('u', 'c', time.time() + 0.1, 'nope')
+        st.cancel_reminder('u', rid)
+        client = SimpleNamespace(chat_postMessage=AsyncMock())
+        rm = ns['ReminderManager'](client, st)
+        rm._spawn(rid, 'c', 'u', 0.1, 'nope')
+        await asyncio.sleep(0.8)
+        client.chat_postMessage.assert_not_called()
+
+    async def test_schedule_at_has_no_seven_day_clamp(self):
+        st = Store(':memory:')
+        rm = ns['ReminderManager'](SimpleNamespace(chat_postMessage=AsyncMock()), st)
+        fire_at = time.time() + 20 * 86400
+        rid = rm.schedule_at('c', 'u', fire_at, 'far')
+        self.assertEqual(st.pending_reminders()[0]['fire_at'], fire_at)
+        self.assertEqual(st.pending_reminders()[0]['id'], rid)
 
 if __name__ == '__main__':
     unittest.main()
