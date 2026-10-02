@@ -17,8 +17,8 @@ Status: early prototype. The list below separates what runs today from what is p
 
 - Chat in Slack DMs, channels, or by @mention (Slack Bolt, Socket Mode, no public URL needed)
 - Model router: Qwen via OpenRouter first, automatic Groq fallback
-- Short-term memory: last 20 messages per user, kept in process
-- Reminders: "remind me in 2 hours to submit the lab report" pings you in Slack at that time (up to 7 days)
+- Memory: last 20 messages per user, stored in SQLite (`relay.db`) so it survives restarts
+- Reminders: "remind me in 2 hours to submit the lab report" pings you in Slack at that time (up to 7 days). Pending reminders are stored in SQLite and re-armed on restart; ones that came due while offline fire on boot
 - Channel allowlist and optional mention-required mode
 
 ## Planned
@@ -34,7 +34,6 @@ Status: early prototype. The list below separates what runs today from what is p
 | Event radar | Surface hackathons, fests and competitions worth your time |
 | Attendance and admin nudges | Reminders about attendance thresholds, fee dates and forms |
 | Group project coordination (vision) | Each teammate runs their own Relay instance. The instances coordinate with each other: shared project memory of who did what, tasks handed between teammates' agents, nudges when someone goes quiet, repo and doc links in one pinned place |
-| Persistent memory | Memory and reminders stored on disk so they survive restarts (today they are lost on restart) |
 | Approval prompts | Ask before sending, posting or changing anything outside Slack |
 
 Group project coordination is the long-term differentiator: separately owned instances that can still cooperate. It is a design goal, not something that exists yet.
@@ -64,6 +63,7 @@ Invite the bot to a channel (`/invite @Relay`) or DM it from the Apps section.
 | `OPENROUTER_MODEL` | Primary model ID (default in `.env.example`) |
 | `GROQ_API_KEY`, `GROQ_MODEL` | Fallback model (optional) |
 | `ALLOWED_CHANNEL_IDS` | Comma-separated channel IDs to answer in; empty means all |
+| `RELAY_DB_PATH` | SQLite file for memory and reminders (default `relay.db`) |
 | `REQUIRE_MENTION` | `true` = in channels, answer when @mentioned (DMs always answered) |
 
 ## Tests
