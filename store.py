@@ -31,6 +31,18 @@ CREATE TABLE IF NOT EXISTS reminders (
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status, fire_at);
 
+CREATE TABLE IF NOT EXISTS deadlines (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    title TEXT NOT NULL,
+    due_at REAL NOT NULL,
+    status TEXT NOT NULL DEFAULT 'open',
+    reminder_id INTEGER,
+    created_at REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_deadlines_user ON deadlines(user_id, status, due_at);
+
 CREATE TABLE IF NOT EXISTS documents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT NOT NULL,
@@ -108,6 +120,11 @@ class Store:
         with self._lock:
             rows = self._db.execute(sql, args).fetchall()
         return [dict(r) for r in rows]
+
+    def reminder_status(self, reminder_id: int) -> Optional[str]:
+        with self._lock:
+            row = self._db.execute("SELECT status FROM reminders WHERE id = ?", (reminder_id,)).fetchone()
+        return row["status"] if row else None
 
     def mark_reminder(self, reminder_id: int, status: str) -> None:
         with self._lock:
@@ -194,3 +211,47 @@ class Store:
             return rows
         step = len(rows) / limit
         return [rows[int(i * step)] for i in range(limit)]
+
+    # ----- deadlines -----
+
+    def add_deadline(
+        self, user_id: str, channel_id: str, title: str, due_at: float, reminder_id: Optional[int] = None
+    ) -> int:
+        with self._lock:
+            cur = self._db.execute(
+                "INSERT INTO deadlines (user_id, channel_id, title, due_at, reminder_id, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (user_id, channel_id, title, due_at, reminder_id, time.time()),
+            )
+            self._db.commit()
+            return int(cur.lastrowid)
+
+    def list_deadlines(self, user_id: str, until: Optional[float] = None) -> list[dict]:
+        """Open deadlines, soonest first. Overdue ones are always included."""
+        sql = "SELECT * FROM deadlines WHERE user_id = ? AND status = 'open'"
+        args: list = [user_id]
+        if until is not None:
+            sql += " AND due_at <= ?"
+            args.append(until)
+        sql += " ORDER BY due_at"
+        with self._lock:
+            rows = self._db.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def complete_deadline(self, user_id: str, deadline_id: int) -> Optional[dict]:
+        """Mark one of the user's open deadlines done and cancel its reminder. Returns the row or None."""
+        with self._lock:
+            row = self._db.execute(
+                "SELECT * FROM deadlines WHERE id = ? AND user_id = ? AND status = 'open'",
+                (deadline_id, user_id),
+            ).fetchone()
+            if not row:
+                return None
+            self._db.execute("UPDATE deadlines SET status = 'done' WHERE id = ?", (deadline_id,))
+            if row["reminder_id"]:
+                self._db.execute(
+                    "UPDATE reminders SET status = 'cancelled' WHERE id = ? AND status = 'pending'",
+                    (row["reminder_id"],),
+                )
+            self._db.commit()
+        return dict(row)
