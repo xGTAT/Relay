@@ -5,7 +5,7 @@ Relay - a personal AI assistant that lives in Slack
 Pure Python, Slack Bolt in Socket Mode (no public endpoint needed).
 
 Features:
-  - Gemini as the primary model, Groq as automatic fallback (both configured by env)
+  - Qwen via OpenRouter as the primary model, Groq as automatic fallback (both configured by env)
   - Sliding window conversation memory per user (20 messages, in-process)
   - Background reminders that @-mention the user in Slack, via asyncio
   - Natural, adaptive tone: casual for chat, structured for work
@@ -30,9 +30,8 @@ from datetime import datetime
 from typing import Optional
 
 from dotenv import load_dotenv
-from google import genai
-from google.genai import types
 from groq import AsyncGroq
+from openai import AsyncOpenAI
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
@@ -47,7 +46,7 @@ log = logging.getLogger("relay")
 
 SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")  # xoxb-...
 SLACK_APP_TOKEN = os.getenv("SLACK_APP_TOKEN", "")  # xapp-... (Socket Mode)
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 # Slack channel IDs look like C0123ABCD (channels) or D0123ABCD (DMs)
 ALLOWED_CHANNEL_IDS: set[str] = {
@@ -55,8 +54,9 @@ ALLOWED_CHANNEL_IDS: set[str] = {
 }
 REQUIRE_MENTION = os.getenv("REQUIRE_MENTION", "false").lower() == "true"
 
-# Model names are deliberately not hard-coded: set them in .env (see .env.example).
-GEMINI_MODEL = os.getenv("GEMINI_MODEL", "")
+OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3.8-27b:free")
+# Groq has no default: set GROQ_MODEL in .env (see .env.example).
 GROQ_MODEL = os.getenv("GROQ_MODEL", "")
 MAX_MEMORY = 20
 MAX_MESSAGE_LENGTH = 3000  # well under Slack's limit, keeps replies readable
@@ -119,10 +119,10 @@ memory = SessionMemory()
 
 
 def groq_text_messages(messages: list[dict]) -> list[dict]:
-    """Convert text history to Groq roles without replaying provider tool state.
+    """Convert text history to OpenAI-style roles without replaying provider tool state.
 
     SessionMemory stores only user text and final assistant replies. Accept the
-    legacy Gemini "model" role too, so existing sessions remain usable. Tool
+    legacy "model" role too, so existing sessions remain usable. Tool
     calls/results belong only to their request-local tool exchange below.
     """
     converted = []
@@ -134,7 +134,7 @@ def groq_text_messages(messages: list[dict]) -> list[dict]:
             continue
         text = message.get("content")
         if not isinstance(text, str):
-            # Tolerate text-only Gemini dictionary history, not function parts.
+            # Tolerate text-only dictionary history, not function parts.
             text = "\n".join(
                 part["text"] for part in (message.get("parts") or [])
                 if isinstance(part, dict) and isinstance(part.get("text"), str)
@@ -167,7 +167,7 @@ class ReminderManager:
     ) -> str:
         """Schedule a background reminder. Returns an immediate confirmation string.
 
-        Safe to call from any thread (Gemini tool execution may run off-loop);
+        Safe to call from any thread (tool execution may run off-loop);
         the fire coroutine is submitted to the captured event loop.
         """
         delay_seconds = max(1, int(delay_seconds))
@@ -216,12 +216,35 @@ def _format_delay(seconds: int) -> str:
         return f"{h} hour{'s' if h != 1 else ''}"
 
 # ---------------------------------------------------------------------------
-# LLM Manager (Gemini primary, Groq fallback)
+# LLM Manager (OpenRouter primary, Groq fallback; both OpenAI-style APIs)
 # ---------------------------------------------------------------------------
+
+REMINDER_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "schedule_reminder",
+        "description": "Schedule a future reminder that will ping the user in Slack after the specified delay.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "delay_seconds": {
+                    "type": "integer",
+                    "description": "Seconds to wait before sending the reminder.",
+                },
+                "reminder_text": {
+                    "type": "string",
+                    "description": "The task or note to remind the user about.",
+                },
+            },
+            "required": ["delay_seconds", "reminder_text"],
+        },
+    },
+}
+
 
 class LLMManager:
     def __init__(self):
-        self.gemini = genai.Client(api_key=GEMINI_API_KEY)
+        self.openrouter = AsyncOpenAI(api_key=OPENROUTER_API_KEY, base_url=OPENROUTER_BASE_URL)
         self.groq = AsyncGroq(api_key=GROQ_API_KEY)
 
     async def chat(
@@ -236,16 +259,15 @@ class LLMManager:
         # Add current message to memory
         memory.add(user_id, "user", f"[{username}] {message}")
 
-        # Build messages list for Groq (also used as fallback-safe format)
         messages = [{"role": "system", "content": build_system_prompt()}]
         for h in history:
             messages.append(h)
         messages.append({"role": "user", "content": f"[{username}] {message}"})
 
         try:
-            response_text = await self._call_gemini(messages, reminder_manager, channel_id, user_id)
+            response_text = await self._call_openrouter(messages, reminder_manager, channel_id, user_id)
         except Exception as e:
-            log.warning(f"Gemini failed ({type(e).__name__}: {e}), falling back to Groq...")
+            log.warning(f"OpenRouter failed ({type(e).__name__}: {e}), falling back to Groq...")
             try:
                 response_text = await self._call_groq(messages, reminder_manager, channel_id, user_id)
             except Exception as e2:
@@ -259,90 +281,31 @@ class LLMManager:
         memory.add(user_id, "assistant", response_text)
         return response_text
 
-    async def _call_gemini(
+    async def _call_openrouter(self, messages, reminder_manager, channel_id, user_id) -> str:
+        return await self._call_openai_style(
+            self.openrouter, OPENROUTER_MODEL, messages, reminder_manager, channel_id, user_id
+        )
+
+    async def _call_groq(self, messages, reminder_manager, channel_id, user_id) -> str:
+        return await self._call_openai_style(
+            self.groq, GROQ_MODEL, messages, reminder_manager, channel_id, user_id
+        )
+
+    async def _call_openai_style(
         self,
+        client,
+        model: str,
         messages: list[dict],
         reminder_manager: ReminderManager,
         channel_id: str,
         user_id: str,
     ) -> str:
-        # Build Gemini contents from history (skip system message which goes in config)
-        contents = []
-        for msg in messages:
-            if msg["role"] == "system":
-                continue
-            role = "user" if msg["role"] == "user" else "model"
-            contents.append(types.Content(role=role, parts=[types.Part(text=msg["content"])]))
-
-        async def schedule_reminder(delay_seconds: int, reminder_text: str) -> str:
-            """Schedule a future reminder that will ping the user in Slack after the specified delay.
-
-            Args:
-                delay_seconds: Number of seconds to wait before sending the reminder.
-                reminder_text: The task or note to remind the user about.
-            """
-            return reminder_manager.schedule(
-                channel_id=channel_id,
-                user_id=user_id,
-                delay_seconds=delay_seconds,
-                reminder_text=reminder_text,
-            )
-
-        # Use the exact system message built for this request (includes live clock)
-        system_instruction = next(
-            (m["content"] for m in messages if m["role"] == "system"), SYSTEM_PROMPT
-        )
-        config = types.GenerateContentConfig(
-            system_instruction=system_instruction,
-            tools=[schedule_reminder],
-            temperature=0.7,
-        )
-
-        response = await self.gemini.aio.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=contents,
-            config=config,
-        )
-
-        return response.text or "I'm not sure how to respond to that."
-
-    async def _call_groq(
-        self,
-        messages: list[dict],
-        reminder_manager: ReminderManager,
-        channel_id: str,
-        user_id: str,
-    ) -> str:
-        # Never send Gemini's "model" role or persisted tool state to Groq.
+        """One tool-calling exchange against any OpenAI-compatible chat API."""
         messages = groq_text_messages(messages)
-        groq_tools = [
-            {
-                "type": "function",
-                "function": {
-                    "name": "schedule_reminder",
-                    "description": "Schedule a future reminder that will ping the user in Slack after the specified delay.",
-                    "parameters": {
-                        "type": "object",
-                        "properties": {
-                            "delay_seconds": {
-                                "type": "integer",
-                                "description": "Seconds to wait before sending the reminder.",
-                            },
-                            "reminder_text": {
-                                "type": "string",
-                                "description": "The task or note to remind the user about.",
-                            },
-                        },
-                        "required": ["delay_seconds", "reminder_text"],
-                    },
-                },
-            }
-        ]
-
-        response = await self.groq.chat.completions.create(
-            model=GROQ_MODEL,
+        response = await client.chat.completions.create(
+            model=model,
             messages=messages,
-            tools=groq_tools,
+            tools=[REMINDER_TOOL],
             tool_choice="auto",
             temperature=0.7,
             max_tokens=1024,
@@ -389,15 +352,15 @@ class LLMManager:
                     ],
                 }
                 follow_messages = messages + [assistant_message] + tool_results
-                follow_response = await self.groq.chat.completions.create(
-                    model=GROQ_MODEL,
+                follow_response = await client.chat.completions.create(
+                    model=model,
                     messages=follow_messages,
                     temperature=0.7,
                     max_tokens=1024,
                 )
                 return follow_response.choices[0].message.content or confirmation_text
             except Exception as e:
-                log.warning(f"Groq follow-up failed ({e}), using direct confirmation: {confirmation_text}")
+                log.warning(f"Follow-up failed ({e}), using direct confirmation: {confirmation_text}")
                 return confirmation_text
 
         return msg.content or "I'm not sure how to respond to that."
@@ -501,10 +464,8 @@ async def main() -> None:
     global llm, reminders, BOT_USER_ID
     if not SLACK_BOT_TOKEN or not SLACK_APP_TOKEN:
         raise RuntimeError("SLACK_BOT_TOKEN and SLACK_APP_TOKEN must be set in .env")
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY not set in .env")
-    if not GEMINI_MODEL:
-        raise RuntimeError("GEMINI_MODEL not set in .env (see .env.example)")
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY not set in .env")
     if not GROQ_API_KEY:
         log.warning("GROQ_API_KEY not set - Groq fallback will be unavailable")
     elif not GROQ_MODEL:
@@ -515,7 +476,7 @@ async def main() -> None:
     llm = LLMManager()
     reminders = ReminderManager(app.client)
     log.info(f"Relay is online as {auth['user']} ({BOT_USER_ID}) in workspace {auth['team']}")
-    log.info(f"Primary LLM: {GEMINI_MODEL} | Fallback: {GROQ_MODEL or 'none'}")
+    log.info(f"Primary LLM: {OPENROUTER_MODEL} | Fallback: {GROQ_MODEL or 'none'}")
     log.info(f"Restricted to channels: {ALLOWED_CHANNEL_IDS or 'all the bot is in'}")
     await AsyncSocketModeHandler(app, SLACK_APP_TOKEN).start_async()
 
