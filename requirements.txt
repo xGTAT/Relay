@@ -1,5 +1,5 @@
 slack-bolt>=1.18
 aiohttp>=3.9
-google-genai>=1.0
+openai>=1.40
 groq>=0.11
 python-dotenv>=1.0
