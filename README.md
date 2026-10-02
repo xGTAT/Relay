@@ -19,7 +19,7 @@ Status: early prototype. The list below separates what runs today from what is p
 - Model router: Qwen via OpenRouter first, automatic Groq fallback
 - Memory: last 20 messages per user, stored in SQLite (`relay.db`) so it survives restarts
 - Reminders: "remind me in 2 hours to submit the lab report" pings you in Slack at that time (up to 7 days). Pending reminders are stored in SQLite and re-armed on restart; ones that came due while offline fire on boot
-- Course PDFs: upload a PDF in Slack and Relay indexes it per user (SQLite full-text search). Ask questions about it and get answers with document and page references, or ask for a quiz with an answer key. Text PDFs only, no OCR for scans
+- Course PDFs: upload a PDF in Slack and Relay indexes it per user (SQLite full-text search). Ask questions about it and get answers with document and page references, or ask for a quiz with an answer key. Text PDFs just, no OCR for scans
 - Channel allowlist and optional mention-required mode
 
 ## Planned
