@@ -11,8 +11,9 @@ from unittest.mock import AsyncMock, Mock
 
 source = ast.parse(Path(__file__).with_name('bot.py').read_text())
 keep = {'SessionMemory', 'groq_text_messages', 'LLMManager'}
-module = ast.Module(body=[n for n in source.body if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in keep], type_ignores=[])
-ns = dict(defaultdict=defaultdict, deque=deque, dataclass=dataclass, field=field, MAX_MEMORY=20, MAX_MESSAGE_LENGTH=3000, json=json, ReminderManager=object, GROQ_MODEL='mock', build_system_prompt=lambda: 'system', log=Mock())
+assigns = [n for n in source.body if isinstance(n, ast.Assign) and any(getattr(x, 'id', '') == 'REMINDER_TOOL' for x in n.targets)]
+module = ast.Module(body=assigns + [n for n in source.body if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in keep], type_ignores=[])
+ns = dict(defaultdict=defaultdict, deque=deque, dataclass=dataclass, field=field, MAX_MEMORY=20, MAX_MESSAGE_LENGTH=3000, json=json, ReminderManager=object, GROQ_MODEL='mock', OPENROUTER_MODEL='mock-or', build_system_prompt=lambda: 'system', log=Mock())
 exec(compile(module, 'bot.py', 'exec'), ns)
 
 class HistoryTests(unittest.IsolatedAsyncioTestCase):
@@ -22,11 +23,13 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.create = AsyncMock()
         self.manager.groq = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self.create)))
         self.reminders = Mock()
+        self.or_create = AsyncMock()
+        self.manager.openrouter = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self.or_create)))
 
     def response(self, content, tool_calls=None):
         return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=content, tool_calls=tool_calls))])
 
-    def test_legacy_and_gemini_text_conversion(self):
+    def test_legacy_and_openrouter_text_conversion(self):
         converted = ns['groq_text_messages']([
             {'role':'system','content':'system'},
             {'role':'user','content':'hello'},
@@ -45,7 +48,7 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
     async def test_multiturn_fallback_and_new_memory(self):
         ns['memory'].add('u', 'user', 'previous')
         ns['memory'].add('u', 'model', 'legacy reply')
-        self.manager._call_gemini = AsyncMock(side_effect=RuntimeError('503'))
+        self.manager._call_openrouter = AsyncMock(side_effect=RuntimeError('503'))
         self.create.side_effect = [self.response('first'), self.response('second')]
         for text in ('next', 'again'):
             await self.manager.chat('u','name',text,self.reminders,'c')
@@ -73,6 +76,24 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         result = await self.manager._call_groq([{'role':'user','content':'remind'}],self.reminders,'c','u')
         self.assertEqual(result,'Reminder set')
         self.reminders.schedule.assert_called_once()
+
+    async def test_openrouter_primary_tool_calling(self):
+        tc = SimpleNamespace(id='call_9', function=SimpleNamespace(name='schedule_reminder', arguments='{"delay_seconds":60,"reminder_text":"viva prep"}'))
+        self.reminders.schedule.return_value = 'Reminder set'
+        self.or_create.side_effect = [self.response(None,[tc]), self.response('Sorted')]
+        result = await self.manager.chat('u','name','remind me in a minute',self.reminders,'c')
+        self.assertEqual(result,'Sorted')
+        self.create.assert_not_called()
+        first = self.or_create.call_args_list[0].kwargs
+        self.assertEqual(first['model'],'mock-or')
+        self.assertEqual(first['tools'][0]['function']['name'],'schedule_reminder')
+        self.reminders.schedule.assert_called_once_with(channel_id='c',user_id='u',delay_seconds=60,reminder_text='viva prep')
+
+    async def test_falls_back_to_groq_when_openrouter_fails(self):
+        self.or_create.side_effect = RuntimeError('429')
+        self.create.side_effect = [self.response('from groq')]
+        result = await self.manager.chat('u','name','hi',self.reminders,'c')
+        self.assertEqual(result,'from groq')
 
 if __name__ == '__main__':
     unittest.main()
