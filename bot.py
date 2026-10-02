@@ -117,6 +117,32 @@ class SessionMemory:
 
 memory = SessionMemory()
 
+
+def groq_text_messages(messages: list[dict]) -> list[dict]:
+    """Convert text history to Groq roles without replaying provider tool state.
+
+    SessionMemory stores only user text and final assistant replies. Accept the
+    legacy Gemini "model" role too, so existing sessions remain usable. Tool
+    calls/results belong only to their request-local tool exchange below.
+    """
+    converted = []
+    for message in messages:
+        role = message.get("role")
+        if role == "model":
+            role = "assistant"
+        if role not in {"system", "user", "assistant"}:
+            continue
+        text = message.get("content")
+        if not isinstance(text, str):
+            # Tolerate text-only Gemini dictionary history, not function parts.
+            text = "\n".join(
+                part["text"] for part in (message.get("parts") or [])
+                if isinstance(part, dict) and isinstance(part.get("text"), str)
+            )
+        if text:
+            converted.append({"role": role, "content": text})
+    return converted
+
 # ---------------------------------------------------------------------------
 # Reminder Engine
 # ---------------------------------------------------------------------------
@@ -230,7 +256,7 @@ class LLMManager:
         if len(response_text) > MAX_MESSAGE_LENGTH:
             response_text = response_text[:MAX_MESSAGE_LENGTH - 3] + "..."
 
-        memory.add(user_id, "model", response_text)
+        memory.add(user_id, "assistant", response_text)
         return response_text
 
     async def _call_gemini(
@@ -287,6 +313,8 @@ class LLMManager:
         channel_id: str,
         user_id: str,
     ) -> str:
+        # Never send Gemini's "model" role or persisted tool state to Groq.
+        messages = groq_text_messages(messages)
         groq_tools = [
             {
                 "type": "function",
@@ -344,7 +372,23 @@ class LLMManager:
 
             # Follow-up call with tool results
             try:
-                follow_messages = messages + [msg] + tool_results
+                # Serialize only request fields, not the SDK response object.
+                assistant_message = {
+                    "role": "assistant",
+                    "content": msg.content,
+                    "tool_calls": [
+                        {
+                            "id": tc.id,
+                            "type": "function",
+                            "function": {
+                                "name": tc.function.name,
+                                "arguments": tc.function.arguments,
+                            },
+                        }
+                        for tc in msg.tool_calls
+                    ],
+                }
+                follow_messages = messages + [assistant_message] + tool_results
                 follow_response = await self.groq.chat.completions.create(
                     model=GROQ_MODEL,
                     messages=follow_messages,
