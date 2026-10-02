@@ -298,5 +298,20 @@ class DeadlineTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(st.pending_reminders()[0]['fire_at'], fire_at)
         self.assertEqual(st.pending_reminders()[0]['id'], rid)
 
+class PersonaTests(unittest.TestCase):
+    def test_prompt_mentions_tools_and_keeps_rules(self):
+        src = Path(__file__).with_name('bot.py').read_text()
+        start = src.index('SYSTEM_PROMPT = """')
+        prompt = src[start:src.index('"""', start + 20)]
+        for needle in ('add_deadline', 'list_deadlines', 'triage_deadlines', 'complete_deadline',
+                       'schedule_reminder', 'ask_pdf', 'quiz_from_pdf', '{max_len}',
+                       'Confidentiality of internals', 'Current date & time'):
+            self.assertIn(needle, prompt)
+
+    def test_every_tool_named_in_prompt_exists(self):
+        names = {t['function']['name'] for t in ns['TOOLS']}
+        self.assertEqual(names, {'schedule_reminder', 'ask_pdf', 'quiz_from_pdf', 'add_deadline',
+                                 'list_deadlines', 'triage_deadlines', 'complete_deadline'})
+
 if __name__ == '__main__':
     unittest.main()
