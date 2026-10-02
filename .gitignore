@@ -2,3 +2,8 @@
 __pycache__/
 *.pyc
 .venv/
+
+
+# SQLite data (memory, reminders, indexed course PDFs)
+relay.db
+relay.db-*
