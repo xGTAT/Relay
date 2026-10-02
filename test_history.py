@@ -2,6 +2,7 @@
 import ast
 import asyncio
 import json
+import time
 import unittest
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
@@ -9,16 +10,18 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
+from store import Store
+
 source = ast.parse(Path(__file__).with_name('bot.py').read_text())
-keep = {'SessionMemory', 'groq_text_messages', 'LLMManager'}
+keep = {'SessionMemory', 'groq_text_messages', 'LLMManager', 'ReminderManager', '_format_delay'}
 assigns = [n for n in source.body if isinstance(n, ast.Assign) and any(getattr(x, 'id', '') == 'REMINDER_TOOL' for x in n.targets)]
 module = ast.Module(body=assigns + [n for n in source.body if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in keep], type_ignores=[])
-ns = dict(defaultdict=defaultdict, deque=deque, dataclass=dataclass, field=field, MAX_MEMORY=20, MAX_MESSAGE_LENGTH=3000, json=json, ReminderManager=object, GROQ_MODEL='mock', OPENROUTER_MODEL='mock-or', build_system_prompt=lambda: 'system', log=Mock())
+ns = dict(defaultdict=defaultdict, deque=deque, dataclass=dataclass, field=field, MAX_MEMORY=20, MAX_MESSAGE_LENGTH=3000, json=json, asyncio=asyncio, time=time, Store=Store, GROQ_MODEL='mock', OPENROUTER_MODEL='mock-or', build_system_prompt=lambda: 'system', log=Mock())
 exec(compile(module, 'bot.py', 'exec'), ns)
 
 class HistoryTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        ns['memory'] = ns['SessionMemory']()
+        ns['memory'] = ns['SessionMemory'](Store(':memory:'))
         self.manager = ns['LLMManager'].__new__(ns['LLMManager'])
         self.create = AsyncMock()
         self.manager.groq = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=self.create)))
@@ -94,6 +97,55 @@ class HistoryTests(unittest.IsolatedAsyncioTestCase):
         self.create.side_effect = [self.response('from groq')]
         result = await self.manager.chat('u','name','hi',self.reminders,'c')
         self.assertEqual(result,'from groq')
+
+class PersistenceTests(unittest.IsolatedAsyncioTestCase):
+    def test_memory_survives_reopen_and_windows(self):
+        import os, tempfile
+        path = os.path.join(tempfile.mkdtemp(), 'r.db')
+        mem = ns['SessionMemory'](Store(path))
+        for i in range(25):
+            mem.add('u', 'user', f'm{i}')
+        mem2 = ns['SessionMemory'](Store(path))
+        hist = mem2.get_history('u')
+        self.assertEqual(len(hist), 20)
+        self.assertEqual(hist[0]['content'], 'm5')
+        self.assertEqual(hist[-1]['content'], 'm24')
+        mem2.clear('u')
+        self.assertEqual(mem2.get_history('u'), [])
+
+    async def test_reminders_restored_after_restart(self):
+        store = Store(':memory:')
+        now = time.time()
+        store.add_reminder('u', 'c', now + 0.2, 'soon')
+        store.add_reminder('u', 'c', now - 50, 'overdue')
+        done = store.add_reminder('u', 'c', now - 10, 'done already')
+        store.mark_reminder(done, 'done')
+        client = SimpleNamespace(chat_postMessage=AsyncMock())
+        rm = ns['ReminderManager'](client, store)
+        self.assertEqual(rm.restore(), 2)
+        await asyncio.sleep(1.8)
+        texts = sorted(c.kwargs['text'] for c in client.chat_postMessage.call_args_list)
+        self.assertEqual(len(texts), 2)
+        self.assertTrue(any('overdue (sent late' in t for t in texts))
+        self.assertFalse(any('done already' in t for t in texts))
+        self.assertEqual(store.pending_reminders(), [])
+
+    async def test_schedule_persists_reminder(self):
+        store = Store(':memory:')
+        rm = ns['ReminderManager'](SimpleNamespace(chat_postMessage=AsyncMock()), store)
+        msg = rm.schedule('c', 'u', 3600, 'lab record')
+        self.assertIn('lab record', msg)
+        pending = store.pending_reminders()
+        self.assertEqual(len(pending), 1)
+        self.assertEqual(pending[0]['user_id'], 'u')
+        self.assertAlmostEqual(pending[0]['fire_at'] - time.time(), 3600, delta=5)
+
+    def test_cancel_only_own_reminder(self):
+        store = Store(':memory:')
+        rid = store.add_reminder('u', 'c', time.time() + 99, 'x')
+        self.assertFalse(store.cancel_reminder('other', rid))
+        self.assertTrue(store.cancel_reminder('u', rid))
+        self.assertEqual(store.list_reminders('u'), [])
 
 if __name__ == '__main__':
     unittest.main()
