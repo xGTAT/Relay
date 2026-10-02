@@ -1,34 +1,50 @@
 # Relay
 
-A personal AI assistant that lives in Slack. Message it in plain language and it replies, remembers the conversation, and sets reminders that ping you back.
+**Say it once. Consider it done.**
 
-**Status: prototype / idea stage.** This repo is a working starting point ported from an earlier Discord assistant. It is not the full design yet.
+Relay is a self-hosted assistant for college students that lives in Slack. Tell it what you need in plain language. It remembers deadlines so you do not have to.
 
-## What works today
+It is built around four ideas:
 
-- Chat in DMs, channels, or by @mention (Slack Bolt, Socket Mode - no public URL needed)
-- Gemini as the primary model with automatic Groq fallback
+- **Self-hosted.** You run it yourself. Your course material and messages stay on your own setup.
+- **Free-tier friendly.** It runs on free model tiers, with no per-seat pricing.
+- **Model-agnostic.** The model sits behind a thin router. Today that is Qwen through OpenRouter, with Groq as fallback. Swapping models is a config change.
+- **Approval-first.** Anything that touches the outside world should wait for your yes. (Planned, see below.)
+
+Status: early prototype. The list below separates what runs today from what is planned.
+
+## Built today
+
+- Chat in Slack DMs, channels, or by @mention (Slack Bolt, Socket Mode, no public URL needed)
+- Model router: Qwen via OpenRouter first, automatic Groq fallback
 - Short-term memory: last 20 messages per user, kept in process
-- Reminders: "remind me in 2 hours to call Sam" schedules a Slack @mention at that time (max 7 days)
-- Channel allowlist and optional mention-only mode
-- Hourglass reaction while it thinks
+- Reminders: "remind me in 2 hours to submit the lab report" pings you in Slack at that time (up to 7 days)
+- Channel allowlist and optional mention-required mode
 
-## What it does not do yet
+## Planned
 
-- Long-term memory (current memory is in-process and resets on restart; reminders are lost on restart too)
-- Calendar, email or other account integrations
-- Approval prompts before outside actions
-- Multi-step planner/executor or multi-agent structure (this is a single model with one tool loop)
-- Proactive briefings
+| Feature | What it will do |
+|---|---|
+| Smart reminders, automatic | Pick up assignment, exam and competition dates from your LMS and inbox and set reminders for you |
+| Course-aware research | Answer questions from the PDFs your professors share, not the generic web |
+| Study packs and quizzes | Turn course PDFs into summaries and practice questions |
+| Announcement digest | One daily Slack message that summarizes college emails and notices |
+| Deadline triage | A ranked "do this first" list when several submissions land in the same week |
+| Connectors | GitHub and Google (Docs, Slides, Calendar) status and actions in chat |
+| Event radar | Surface hackathons, fests and competitions worth your time |
+| Attendance and admin nudges | Reminders about attendance thresholds, fee dates and forms |
+| Group project coordination (vision) | Each teammate runs their own Relay instance. The instances coordinate with each other: shared project memory of who did what, tasks handed between teammates' agents, nudges when someone goes quiet, repo and doc links in one pinned place |
+| Persistent memory | Memory and reminders stored on disk so they survive restarts (today they are lost on restart) |
+| Approval prompts | Ask before sending, posting or changing anything outside Slack |
 
-These are the planned next steps.
+Group project coordination is the long-term differentiator: separately owned instances that can still cooperate. It is a design goal, not something that exists yet.
 
 ## Setup
 
 1. Create the Slack app: at https://api.slack.com/apps choose **Create New App > From a manifest** and paste `slack-app-manifest.yml`. Install it to your workspace.
 2. Copy the **Bot User OAuth Token** (`xoxb-...`, OAuth & Permissions) into `SLACK_BOT_TOKEN`.
 3. Under **Basic Information > App-Level Tokens**, create a token with the `connections:write` scope and copy it (`xapp-...`) into `SLACK_APP_TOKEN`.
-4. Copy `.env.example` to `.env` and fill in `GEMINI_API_KEY`, `GEMINI_MODEL`, and optionally `GROQ_API_KEY` / `GROQ_MODEL`. Model IDs are not hard-coded, so set ones your keys can use.
+4. Create an OpenRouter key at https://openrouter.ai/keys. Copy `.env.example` to `.env` and fill in `OPENROUTER_API_KEY`. Optionally add `GROQ_API_KEY` and `GROQ_MODEL` for the fallback.
 5. Run:
 
 ```bash
@@ -44,10 +60,17 @@ Invite the bot to a channel (`/invite @Relay`) or DM it from the Apps section.
 | Variable | Purpose |
 |---|---|
 | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` | Slack bot and Socket Mode tokens |
-| `GEMINI_API_KEY`, `GEMINI_MODEL` | Primary model (required) |
+| `OPENROUTER_API_KEY` | Primary model key (required) |
+| `OPENROUTER_MODEL` | Primary model ID (default in `.env.example`) |
 | `GROQ_API_KEY`, `GROQ_MODEL` | Fallback model (optional) |
 | `ALLOWED_CHANNEL_IDS` | Comma-separated channel IDs to answer in; empty means all |
-| `REQUIRE_MENTION` | `true` = in channels only answer when @mentioned (DMs always answered) |
+| `REQUIRE_MENTION` | `true` = in channels, answer when @mentioned (DMs always answered) |
+
+## Tests
+
+```bash
+python test_history.py
+```
 
 ## License
 
