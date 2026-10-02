@@ -20,17 +20,17 @@ Status: early prototype. The list below separates what runs today from what is p
 - Memory: last 20 messages per user, stored in SQLite (`relay.db`) so it survives restarts
 - Reminders: "remind me in 2 hours to submit the lab report" pings you in Slack at that time (up to 7 days). Pending reminders are stored in SQLite and re-armed on restart; ones that came due while offline fire on boot
 - Course PDFs: upload a PDF in Slack and Relay indexes it per user (SQLite full-text search). Ask questions about it and get answers with document and page references, or ask for a quiz with an answer key. Text PDFs just, no OCR for scans
+- Deadlines: tell Relay about an assignment or exam ("DBMS assignment 3 is due Friday 5pm") and it saves it with an automatic reminder a day before. Ask "what's due this week", mark things done, or ask what to do first and get a ranked triage of your open deadlines
 - Channel allowlist and optional mention-required mode
 
 ## Planned
 
 | Feature | What it will do |
 |---|---|
-| Smart reminders, automatic | Pick up assignment, exam and competition dates from your LMS and inbox and set reminders for you |
+| Smart reminders, automatic | Pick up assignment, exam and competition dates from your LMS and inbox and set deadlines and reminders for you (today you tell Relay yourself) |
 | Course-aware research, deeper | Pull course material automatically from the LMS and handle scanned PDFs (today you upload text PDFs by hand) |
 | Study packs | Summaries and revision plans from course PDFs (quizzes already work) |
 | Announcement digest | One daily Slack message that summarizes college emails and notices |
-| Deadline triage | A ranked "do this first" list when several submissions land in the same week |
 | Connectors | GitHub and Google (Docs, Slides, Calendar) status and actions in chat |
 | Event radar | Surface hackathons, fests and competitions worth your time |
 | Attendance and admin nudges | Reminders about attendance thresholds, fee dates and forms |
