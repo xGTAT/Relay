@@ -11,12 +11,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
 from store import Store
+from pdfindex import chunk_pages, extract_pages
 
 source = ast.parse(Path(__file__).with_name('bot.py').read_text())
-keep = {'SessionMemory', 'groq_text_messages', 'LLMManager', 'ReminderManager', '_format_delay'}
-assigns = [n for n in source.body if isinstance(n, ast.Assign) and any(getattr(x, 'id', '') == 'REMINDER_TOOL' for x in n.targets)]
-module = ast.Module(body=assigns + [n for n in source.body if isinstance(n, (ast.ClassDef, ast.FunctionDef)) and n.name in keep], type_ignores=[])
-ns = dict(defaultdict=defaultdict, deque=deque, dataclass=dataclass, field=field, MAX_MEMORY=20, MAX_MESSAGE_LENGTH=3000, json=json, asyncio=asyncio, time=time, Store=Store, GROQ_MODEL='mock', OPENROUTER_MODEL='mock-or', build_system_prompt=lambda: 'system', log=Mock())
+keep = {'SessionMemory', 'groq_text_messages', 'LLMManager', 'ReminderManager', '_format_delay', 'format_passages', 'run_tool', 'ingest_pdfs', 'download_slack_file'}
+assigns = [n for n in source.body if isinstance(n, ast.Assign) and any(getattr(x, 'id', '') in {'REMINDER_TOOL', 'ASK_PDF_TOOL', 'QUIZ_TOOL', 'TOOLS'} for x in n.targets)]
+module = ast.Module(body=assigns + [n for n in source.body if isinstance(n, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)) and n.name in keep], type_ignores=[])
+ns = dict(defaultdict=defaultdict, deque=deque, dataclass=dataclass, field=field, MAX_MEMORY=20, MAX_MESSAGE_LENGTH=3000, json=json, asyncio=asyncio, time=time, MAX_TOOL_CHARS=6000, MAX_PDF_BYTES=25*1024*1024, extract_pages=extract_pages, chunk_pages=chunk_pages, store=Store(':memory:'), SLACK_BOT_TOKEN='x', aiohttp=Mock(), Optional=object, Store=Store, GROQ_MODEL='mock', OPENROUTER_MODEL='mock-or', build_system_prompt=lambda: 'system', log=Mock())
 exec(compile(module, 'bot.py', 'exec'), ns)
 
 class HistoryTests(unittest.IsolatedAsyncioTestCase):
@@ -146,6 +147,89 @@ class PersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(store.cancel_reminder('other', rid))
         self.assertTrue(store.cancel_reminder('u', rid))
         self.assertEqual(store.list_reminders('u'), [])
+
+def make_pdf(pages_text):
+    from reportlab.pdfgen import canvas
+    import io
+    buf = io.BytesIO()
+    c = canvas.Canvas(buf)
+    for txt in pages_text:
+        c.drawString(72, 750, txt)
+        c.showPage()
+    c.save()
+    return buf.getvalue()
+
+
+class PdfTests(unittest.IsolatedAsyncioTestCase):
+    def test_extract_and_chunk(self):
+        data = make_pdf(['Photosynthesis converts light into chemical energy.', 'Mitochondria produce ATP.'])
+        pages = extract_pages(data)
+        self.assertEqual(len(pages), 2)
+        chunks = chunk_pages(pages)
+        self.assertEqual([p for p, _ in chunks], [1, 2])
+        self.assertIn('ATP', chunks[1][1])
+
+    def test_chunk_overlap_and_long_pages(self):
+        chunks = chunk_pages(['word ' * 600], size=500, overlap=50)
+        self.assertGreater(len(chunks), 4)
+        self.assertTrue(all(len(t) <= 500 for _, t in chunks))
+        self.assertEqual(chunk_pages(['   ', '']), [])
+
+    def test_search_is_scoped_per_user_and_replaces_reupload(self):
+        st = Store(':memory:')
+        st.add_document('a', 'bio.pdf', 1, [(1, 'Mitochondria produce ATP in the cell')])
+        st.add_document('b', 'chem.pdf', 1, [(1, 'Mitochondria is not discussed; acids and bases')])
+        hits = st.search_chunks('a', 'what do mitochondria produce?')
+        self.assertEqual([h['doc_name'] for h in hits], ['bio.pdf'])
+        self.assertEqual(st.search_chunks('a', 'a?'), [])
+        st.add_document('a', 'bio.pdf', 1, [(1, 'Ribosomes make proteins')])
+        self.assertEqual(st.search_chunks('a', 'mitochondria'), [])
+        self.assertEqual(len(st.list_documents('a')), 1)
+        self.assertEqual(len(st.sample_chunks('a', 3)), 1)
+
+    async def test_ingest_pdfs_and_tools(self):
+        st = Store(':memory:')
+        data = make_pdf(['Newton second law: force equals mass times acceleration.'])
+        fetch = AsyncMock(return_value=data)
+        event = {'files': [
+            {'name': 'physics.pdf', 'mimetype': 'application/pdf', 'url_private_download': 'u'},
+            {'name': 'pic.png', 'mimetype': 'image/png', 'url_private_download': 'v'},
+        ]}
+        notes = await ns['ingest_pdfs'](event, 'u', st, fetch=fetch)
+        self.assertIn('Indexed `physics.pdf`', notes[0])
+        self.assertIn('Skipped `pic.png`', notes[1])
+        fetch.assert_awaited_once_with('u')
+        out = ns['run_tool']('ask_pdf', {'question': 'what is force?'}, None, st, 'c', 'u')
+        self.assertIn('physics.pdf, p.1', out)
+        quiz = ns['run_tool']('quiz_from_pdf', {'num_questions': 3}, None, st, 'c', 'u')
+        self.assertIn('Write 3 questions', quiz)
+        self.assertIn('acceleration', quiz)
+        self.assertIn('No course PDFs', ns['run_tool']('ask_pdf', {'question': 'x'}, None, st, 'c', 'nobody'))
+        self.assertIn('Unknown tool', ns['run_tool']('nope', {}, None, st, 'c', 'u'))
+
+    async def test_ingest_handles_bad_and_scanned_pdf(self):
+        st = Store(':memory:')
+        bad = await ns['ingest_pdfs']({'files': [{'name': 'x.pdf', 'mimetype': 'application/pdf', 'url_private_download': 'u'}]}, 'u', st, fetch=AsyncMock(return_value=b'not a pdf'))
+        self.assertIn("Couldn't read", bad[0])
+        blank = await ns['ingest_pdfs']({'files': [{'name': 'y.pdf', 'mimetype': 'application/pdf', 'url_private_download': 'u'}]}, 'u', st, fetch=AsyncMock(return_value=make_pdf([''])))
+        self.assertIn('no selectable text', blank[0])
+
+    async def test_model_tool_loop_uses_pdf_passages(self):
+        st = Store(':memory:')
+        st.add_document('u', 'notes.pdf', 1, [(1, 'The mitochondrion is the powerhouse of the cell')])
+        ns['store'] = st
+        manager = ns['LLMManager'].__new__(ns['LLMManager'])
+        tc = SimpleNamespace(id='c1', function=SimpleNamespace(name='ask_pdf', arguments='{"question":"powerhouse of the cell"}'))
+        create = AsyncMock(side_effect=[
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content=None, tool_calls=[tc]))]),
+            SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(content='The mitochondrion (notes.pdf p.1)', tool_calls=None))]),
+        ])
+        client = SimpleNamespace(chat=SimpleNamespace(completions=SimpleNamespace(create=create)))
+        out = await manager._call_openai_style(client, 'm', [{'role': 'user', 'content': 'q'}], Mock(), 'c', 'u')
+        self.assertIn('mitochondrion', out)
+        tool_msg = create.call_args_list[1].kwargs['messages'][-1]
+        self.assertEqual(tool_msg['role'], 'tool')
+        self.assertIn('notes.pdf, p.1', tool_msg['content'])
 
 if __name__ == '__main__':
     unittest.main()
