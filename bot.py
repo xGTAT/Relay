@@ -27,12 +27,14 @@ import time
 from datetime import datetime
 from typing import Optional
 
+import aiohttp
 from dotenv import load_dotenv
 from groq import AsyncGroq
 from openai import AsyncOpenAI
 from slack_bolt.async_app import AsyncApp
 from slack_bolt.adapter.socket_mode.async_handler import AsyncSocketModeHandler
 
+from pdfindex import chunk_pages, extract_pages
 from store import Store
 
 load_dotenv()
@@ -60,6 +62,8 @@ OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "qwen/qwen3.8-27b:free")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "")
 DB_PATH = os.getenv("RELAY_DB_PATH", "relay.db")
 MAX_MEMORY = 20
+MAX_PDF_BYTES = 25 * 1024 * 1024
+MAX_TOOL_CHARS = 6000  # cap on retrieved course text handed to the model
 MAX_MESSAGE_LENGTH = 3000  # well under Slack's limit, keeps replies readable
 
 SYSTEM_PROMPT = """You are Relay, a smart, versatile, and dependable personal assistant in Slack.
@@ -261,6 +265,88 @@ REMINDER_TOOL = {
     },
 }
 
+ASK_PDF_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "ask_pdf",
+        "description": (
+            "Search the course PDFs this user has uploaded and return the most relevant passages. "
+            "Call it for any question about their course material, notes, syllabus or slides, "
+            "then answer only from the passages and cite the document and page."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "question": {"type": "string", "description": "The question or topic to look up."},
+                "document_name": {"type": "string", "description": "Optional part of a file name to restrict the search."},
+            },
+            "required": ["question"],
+        },
+    },
+}
+
+QUIZ_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "quiz_from_pdf",
+        "description": (
+            "Fetch passages from the user's uploaded course PDFs to build a practice quiz. "
+            "After calling it, write the requested number of questions from those passages, "
+            "then give an answer key."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "topic": {"type": "string", "description": "Optional topic. Leave empty to cover the whole document."},
+                "num_questions": {"type": "integer", "description": "How many questions to write (default 5)."},
+                "document_name": {"type": "string", "description": "Optional part of a file name to restrict the quiz."},
+            },
+            "required": [],
+        },
+    },
+}
+
+TOOLS = [REMINDER_TOOL, ASK_PDF_TOOL, QUIZ_TOOL]
+
+
+def format_passages(rows: list[dict]) -> str:
+    out, used = [], 0
+    for r in rows:
+        piece = f"[{r['doc_name']}, p.{r['page']}] {r['text']}"
+        if used + len(piece) > MAX_TOOL_CHARS:
+            break
+        out.append(piece)
+        used += len(piece)
+    return "\n\n".join(out)
+
+
+def run_tool(name: str, args: dict, reminder_manager, store, channel_id: str, user_id: str) -> str:
+    """Execute one tool call and return the text handed back to the model."""
+    if name == "schedule_reminder":
+        return reminder_manager.schedule(
+            channel_id=channel_id,
+            user_id=user_id,
+            delay_seconds=int(args["delay_seconds"]),
+            reminder_text=str(args["reminder_text"]),
+        )
+    if name == "ask_pdf":
+        if not store.list_documents(user_id):
+            return "No course PDFs uploaded yet. Tell the user to upload a PDF in Slack first."
+        rows = store.search_chunks(user_id, str(args.get("question", "")), 5, args.get("document_name"))
+        if not rows:
+            return "No matching passages found in the uploaded PDFs. Say so plainly and do not guess."
+        return format_passages(rows)
+    if name == "quiz_from_pdf":
+        if not store.list_documents(user_id):
+            return "No course PDFs uploaded yet. Tell the user to upload a PDF in Slack first."
+        topic = str(args.get("topic") or "").strip()
+        n = max(1, min(int(args.get("num_questions") or 5), 15))
+        rows = store.search_chunks(user_id, topic, 6, args.get("document_name")) if topic else []
+        if not rows:
+            rows = store.sample_chunks(user_id, 6, args.get("document_name"))
+        return f"Write {n} questions with an answer key from these passages:\n\n" + format_passages(rows)
+    return f"Unknown tool: {name}"
+
 
 class LLMManager:
     def __init__(self):
@@ -325,7 +411,7 @@ class LLMManager:
         response = await client.chat.completions.create(
             model=model,
             messages=messages,
-            tools=[REMINDER_TOOL],
+            tools=TOOLS,
             tool_choice="auto",
             temperature=0.7,
             max_tokens=1024,
@@ -338,20 +424,19 @@ class LLMManager:
             tool_results = []
             confirmation_text = ""
             for tc in msg.tool_calls:
-                if tc.function.name == "schedule_reminder":
-                    args = json.loads(tc.function.arguments)
-                    result = reminder_manager.schedule(
-                        channel_id=channel_id,
-                        user_id=user_id,
-                        delay_seconds=int(args["delay_seconds"]),
-                        reminder_text=str(args["reminder_text"]),
-                    )
-                    confirmation_text = result
-                    tool_results.append({
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "content": result,
-                    })
+                try:
+                    args = json.loads(tc.function.arguments or "{}")
+                    result = run_tool(tc.function.name, args, reminder_manager, store, channel_id, user_id)
+                    if tc.function.name == "schedule_reminder":
+                        confirmation_text = result
+                except Exception as e:
+                    log.warning(f"Tool {tc.function.name} failed: {e}")
+                    result = "That tool call failed. Tell the user briefly and offer to try again."
+                tool_results.append({
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "content": result,
+                })
 
             # Follow-up call with tool results
             try:
@@ -378,10 +463,10 @@ class LLMManager:
                     temperature=0.7,
                     max_tokens=1024,
                 )
-                return follow_response.choices[0].message.content or confirmation_text
+                return follow_response.choices[0].message.content or confirmation_text or "I found the material but could not put the answer together. Please ask again."
             except Exception as e:
                 log.warning(f"Follow-up failed ({e}), using direct confirmation: {confirmation_text}")
-                return confirmation_text
+                return confirmation_text or "I hit a snag writing that up. Please ask again."
 
         return msg.content or "I'm not sure how to respond to that."
 
@@ -396,6 +481,46 @@ reminders: Optional[ReminderManager] = None
 BOT_USER_ID = ""
 
 
+async def download_slack_file(url: str) -> bytes:
+    """Fetch a private Slack file with the bot token (needs the files:read scope)."""
+    headers = {"Authorization": f"Bearer {SLACK_BOT_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            resp.raise_for_status()
+            data = await resp.content.read(MAX_PDF_BYTES + 1)
+    if len(data) > MAX_PDF_BYTES:
+        raise ValueError("file too large")
+    return data
+
+
+async def ingest_pdfs(event: dict, user_id: str, store_: Store, fetch=download_slack_file) -> list[str]:
+    """Index any PDFs attached to a Slack message. Returns one status line per file."""
+    notes = []
+    for f in event.get("files") or []:
+        name = f.get("name") or "document.pdf"
+        is_pdf = f.get("mimetype") == "application/pdf" or name.lower().endswith(".pdf")
+        if not is_pdf:
+            notes.append(f"Skipped `{name}`: I can read PDFs for now.")
+            continue
+        url = f.get("url_private_download") or f.get("url_private")
+        try:
+            data = await fetch(url)
+            pages = await asyncio.to_thread(extract_pages, data)
+            chunks = chunk_pages(pages)
+        except Exception as e:
+            log.warning(f"PDF ingest failed for {name}: {type(e).__name__}: {e}")
+            notes.append(f"Couldn't read `{name}`. It may be too large, protected, or corrupted.")
+            continue
+        if not chunks:
+            notes.append(f"`{name}` has no selectable text (a scan, maybe). I can't read scanned PDFs yet.")
+            continue
+        store_.add_document(user_id, name, len(pages), chunks)
+        notes.append(
+            f"Indexed `{name}`: {len(pages)} pages. Ask me anything about it, or say \"quiz me on it\"."
+        )
+    return notes
+
+
 async def process(event: dict, client) -> None:
     """Shared handler for DMs, channel messages and @mentions."""
     channel = event["channel"]
@@ -405,6 +530,14 @@ async def process(event: dict, client) -> None:
         return
     if ALLOWED_CHANNEL_IDS and channel not in ALLOWED_CHANNEL_IDS:
         return
+
+    # Index uploaded PDFs first, so questions in the same message can use them
+    if event.get("files"):
+        notes = await ingest_pdfs(event, user, store)
+        if notes:
+            await client.chat_postMessage(
+                channel=channel, text="\n".join(notes), thread_ts=event.get("thread_ts")
+            )
 
     # Strip the bot mention from the text
     content = re.sub(rf"<@{BOT_USER_ID}>", "", event.get("text", "")).strip()
@@ -461,8 +594,8 @@ async def process(event: dict, client) -> None:
 
 @app.event("message")
 async def on_message(event, client):
-    # Ignore edits, deletions, bot posts and other subtyped events
-    if event.get("subtype") or event.get("bot_id"):
+    # Ignore edits, deletions, bot posts and other subtyped events (file uploads are kept)
+    if event.get("bot_id") or event.get("subtype") not in (None, "file_share"):
         return
     is_dm = event.get("channel_type") == "im"
     mentioned = f"<@{BOT_USER_ID}>" in event.get("text", "")
