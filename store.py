@@ -4,6 +4,7 @@ One small file-backed database (default relay.db). Safe to call from the event
 loop and from worker threads: a single connection guarded by a lock.
 """
 
+import re
 import sqlite3
 import threading
 import time
@@ -29,6 +30,17 @@ CREATE TABLE IF NOT EXISTS reminders (
     created_at REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_reminders_status ON reminders(status, fire_at);
+
+CREATE TABLE IF NOT EXISTS documents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    pages INTEGER NOT NULL,
+    created_at REAL NOT NULL
+);
+CREATE VIRTUAL TABLE IF NOT EXISTS chunks USING fts5(
+    text, user_id UNINDEXED, doc_id UNINDEXED, doc_name UNINDEXED, page UNINDEXED
+);
 """
 
 
@@ -111,3 +123,74 @@ class Store:
             )
             self._db.commit()
             return cur.rowcount > 0
+
+    # ----- course documents (PDF text, searched with SQLite FTS5) -----
+
+    def add_document(self, user_id: str, name: str, pages: int, chunks: list[tuple[int, str]]) -> int:
+        """Store a document and its (page, text) chunks. Re-uploading a name replaces the old copy."""
+        with self._lock:
+            old = self._db.execute(
+                "SELECT id FROM documents WHERE user_id = ? AND name = ?", (user_id, name)
+            ).fetchall()
+            for row in old:
+                self._db.execute("DELETE FROM chunks WHERE doc_id = ?", (row["id"],))
+                self._db.execute("DELETE FROM documents WHERE id = ?", (row["id"],))
+            cur = self._db.execute(
+                "INSERT INTO documents (user_id, name, pages, created_at) VALUES (?, ?, ?, ?)",
+                (user_id, name, pages, time.time()),
+            )
+            doc_id = int(cur.lastrowid)
+            self._db.executemany(
+                "INSERT INTO chunks (text, user_id, doc_id, doc_name, page) VALUES (?, ?, ?, ?, ?)",
+                [(text, user_id, doc_id, name, page) for page, text in chunks],
+            )
+            self._db.commit()
+            return doc_id
+
+    def list_documents(self, user_id: str) -> list[dict]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT id, name, pages FROM documents WHERE user_id = ? ORDER BY id", (user_id,)
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    @staticmethod
+    def _fts_query(query: str) -> str:
+        words = [w for w in re.findall(r"\w+", query.lower()) if len(w) > 2]
+        return " OR ".join(f'"{w}"' for w in dict.fromkeys(words))
+
+    def search_chunks(
+        self, user_id: str, query: str, limit: int = 5, doc_name: Optional[str] = None
+    ) -> list[dict]:
+        """Best-matching chunks for a user (BM25 ranking). Empty query returns nothing."""
+        match = self._fts_query(query)
+        if not match:
+            return []
+        sql = (
+            "SELECT doc_name, page, text FROM chunks "
+            "WHERE chunks MATCH ? AND user_id = ?"
+        )
+        args: list = [match, user_id]
+        if doc_name:
+            sql += " AND doc_name LIKE ?"
+            args.append(f"%{doc_name}%")
+        sql += " ORDER BY bm25(chunks) LIMIT ?"
+        args.append(limit)
+        with self._lock:
+            rows = self._db.execute(sql, args).fetchall()
+        return [dict(r) for r in rows]
+
+    def sample_chunks(self, user_id: str, limit: int = 6, doc_name: Optional[str] = None) -> list[dict]:
+        """Evenly spaced chunks across a user's documents, for quizzes with no specific topic."""
+        sql = "SELECT rowid, doc_name, page, text FROM chunks WHERE user_id = ?"
+        args: list = [user_id]
+        if doc_name:
+            sql += " AND doc_name LIKE ?"
+            args.append(f"%{doc_name}%")
+        sql += " ORDER BY rowid"
+        with self._lock:
+            rows = [dict(r) for r in self._db.execute(sql, args).fetchall()]
+        if len(rows) <= limit:
+            return rows
+        step = len(rows) / limit
+        return [rows[int(i * step)] for i in range(limit)]
